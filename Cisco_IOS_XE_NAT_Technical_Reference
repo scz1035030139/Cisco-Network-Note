@@ -1,0 +1,892 @@
+
+Support disclaimer: NAT capabilities depend on the router model, IOS XE release, forwarding architecture, and operating mode. Autonomous IOS XE and IOS XE SD-WAN do not necessarily support the same features or configuration syntax. This document is a broad technical reference—not a verified feature matrix for a specific router.
+
+
+
+1. Overview
+
+Network Address Translation—NAT—modifies IP addresses as packets traverse a router. Port Address Translation—PAT—can additionally modify TCP/UDP ports or protocol identifiers.
+
+Common purposes include:
+
+    Allowing private-address hosts to access external networks.
+    Sharing public IPv4 addresses.
+    Publishing internal services.
+    Connecting networks with overlapping addresses.
+    Applying different translated addresses to different destinations.
+    Supporting IPv6-to-IPv4 communication through NAT64.
+
+
+NAT is not a firewall. Translation does not replace access-control policies.
+
+1.1 Feature coverage
+
+Feature family 	Features discussed
+Basic NAT 	Static NAT, dynamic NAT, PAT
+Service publishing 	Static TCP/UDP PAT
+Translation direction 	Inside-source NAT, outside-source NAT
+Selection policies 	ACL-based NAT, route-map NAT, translation exclusion
+Address resources 	NAT pools, interface overload, mapping options
+Routing integration 	VRF-aware NAT, dual-ISP NAT
+Special topologies 	Overlapping networks, hairpin NAT, NVI
+IPv6 interworking 	Stateful NAT64 and related technologies
+Application handling 	ALGs, ICMP, fragments
+Operations 	Translation tables, timeouts, limits, logging
+Availability and scale 	Hardware forwarding, stateful redundancy, CGN-related capabilities
+
+
+2. Reference Topology
+
+Internal hosts → IOS XE NAT router → External network
+
+Role 	Address
+Client A 	10.1.1.10
+Client B 	10.1.1.11
+Internal server 	10.1.1.20
+Router LAN interface 	10.1.1.1
+Router outside interface 	203.0.113.10
+External server 	198.51.100.20
+External client 	198.51.100.30
+
+The external addresses are documentation addresses.
+
+Packet notation
+
+source-IP:source-port → destination-IP:destination-port
+
+Example:
+
+10.1.1.10:50000 → 198.51.100.20:443
+
+
+3. Cisco NAT Terminology
+
+Term 	Definition 	Example
+Inside local 	Inside host’s address as represented inside 	10.1.1.10
+Inside global 	Inside host’s address as represented outside 	203.0.113.10
+Outside global 	Outside host’s address in its outside network 	198.51.100.20
+Outside local 	Outside host’s address as represented inside 	Usually 198.51.100.20, unless translated
+
+Basic inside-source translation
+
+Outbound:
+
+10.1.1.10 → 198.51.100.20
+
+becomes:
+
+203.0.113.10 → 198.51.100.20
+
+Return:
+
+198.51.100.20 → 203.0.113.10
+
+becomes:
+
+198.51.100.20 → 10.1.1.10
+
+Important distinction: Inside-source NAT changes the source address outbound and the destination address on the reverse path.
+
+
+4. NAT Packet Processing
+
+4.1 Classic inside-to-outside flow
+
+    A packet arrives on an interface designated as NAT inside.
+    Routing determines the forwarding path.
+    NAT selects an applicable rule or existing translation.
+    The source address—and possibly source port—is translated.
+    Relevant checksums are updated.
+    The router forwards the packet outside.
+
+
+4.2 Classic outside-to-inside return flow
+
+    The reply arrives on a NAT outside interface.
+    NAT identifies the reverse translation.
+    The destination is translated to the inside-local endpoint.
+    Routing forwards the packet internally.
+
+
+This is a simplified description. NVI, NAT64, and interactions with other services can use different processing details.
+
+4.3 Reachability requirements
+
+NAT still requires:
+
+    A route toward the destination.
+    Upstream reachability to translated addresses.
+    A valid internal return route.
+    Appropriate access policies.
+    A return path through the device holding the translation, or a supported state-sharing design.
+
+
+
+5. Static Inside-Source NAT
+
+Function
+
+Creates a permanent one-to-one mapping:
+
+10.1.1.10 ↔ 203.0.113.10
+
+Packet flow
+
+Stage 	Packet
+Client sends 	10.1.1.10:50000 → 198.51.100.20:443
+Router translates source 	203.0.113.10:50000 → 198.51.100.20:443
+External server replies 	198.51.100.20:443 → 203.0.113.10:50000
+Router translates destination 	198.51.100.20:443 → 10.1.1.10:50000
+
+Characteristics
+
+    The address mapping is configured permanently.
+    Basic address-only static NAT preserves ports.
+    Externally initiated connections can use the mapping if routing and access policies permit.
+    A dedicated translated address is associated with the inside endpoint.
+
+
+Illustrative command
+
+ip nat inside source static 10.1.1.10 203.0.113.10
+
+Interface NAT roles and routing must also be configured.
+
+
+6. Dynamic Inside-Source NAT
+
+Function
+
+Allocates a translated address from a pool when eligible traffic arrives.
+
+Example pool:
+
+203.0.113.10–203.0.113.12
+
+Packet flow
+
+    Client A sends a packet from 10.1.1.10.
+    No applicable dynamic mapping exists.
+    NAT allocates 203.0.113.11.
+    The packet source becomes 203.0.113.11.
+    Replies are translated back to 10.1.1.10.
+    The mapping eventually expires.
+
+
+Characteristics
+
+    Addresses are allocated dynamically.
+    Pure dynamic NAT does not share an address among many inside hosts through PAT.
+    Pool exhaustion prevents additional address allocations.
+    An unsolicited inbound packet generally cannot create the required dynamic inside mapping.
+
+
+Typical configuration elements
+
+    An ACL identifying eligible traffic.
+    ip nat pool …
+    ip nat inside source list … pool …
+
+
+Distinction: Dynamic NAT allocates addresses; PAT multiplexes flows.
+
+
+7. PAT / NAT Overload
+
+Function
+
+Allows multiple inside hosts to share one or more translated addresses.
+
+Packet flow
+
+Host 	Before PAT 	After PAT
+Client A 	10.1.1.10:50000 → 198.51.100.20:443 	203.0.113.10:50000 → 198.51.100.20:443
+Client B 	10.1.1.11:50000 → 198.51.100.20:443 	203.0.113.10:50001 → 198.51.100.20:443
+
+Return traffic to translated port 50000 reaches Client A. Return traffic to 50001 reaches Client B.
+
+Variants
+
+Interface overload
+
+Uses an interface address:
+
+ip nat inside source list NAT-LAN interface GigabitEthernet0/0/0 overload
+
+Pool overload
+
+Uses addresses from a pool:
+
+ip nat inside source list NAT-LAN pool NAT-POOL overload
+
+Resource considerations
+
+PAT capacity depends on:
+
+    Available translated addresses and ports.
+    Protocol and mapping behavior.
+    Active flows.
+    Translation limits.
+    Platform memory and dataplane capacity.
+
+
+It is inaccurate to describe PAT capacity simply as “65,535 users per public address.”
+
+
+8. Static PAT / Port Forwarding
+
+Function
+
+Maps a particular external service endpoint to an internal endpoint.
+
+Mapping:
+
+TCP 203.0.113.10:8443 → 10.1.1.20:443
+
+Packet flow
+
+Stage 	Packet
+External request 	198.51.100.30:51000 → 203.0.113.10:8443
+Delivered internally 	198.51.100.30:51000 → 10.1.1.20:443
+Server reply 	10.1.1.20:443 → 198.51.100.30:51000
+Translated reply 	203.0.113.10:8443 → 198.51.100.30:51000
+
+Illustrative command
+
+ip nat inside source static tcp 10.1.1.20 443 203.0.113.10 8443
+
+Considerations
+
+    TCP and UDP require separate mappings.
+    Several services can share a public address using different ports.
+    Check for conflicts with router-local services.
+    Port forwarding does not automatically permit traffic through an ACL or firewall.
+
+
+
+9. NAT Pools and Static Mapping Options
+
+9.1 Address pools
+
+A NAT pool defines eligible translated addresses.
+
+Flow: New packet → allocate an address or address/port combination → create mapping → forward.
+
+Upstream devices must route or otherwise deliver traffic for those addresses to the NAT router.
+
+9.2 Additional options
+
+Depending on platform and release, IOS XE can provide options for:
+
+    Static network or prefix mappings.
+    Interface-based static PAT.
+    Route-map-associated static mappings.
+    extendable static translations.
+    Alias/ARP behavior.
+    Automatic route creation in applicable outside-source configurations.
+
+
+These options have different purposes.
+
+For example, extendable permits certain static translation combinations to coexist; it does not provide unrestricted support for every overlapping policy design.
+
+
+10. ACL-Based NAT Selection and Translation Exclusion
+
+Function
+
+An ACL identifies traffic eligible for a NAT rule.
+
+Packet examples
+
+External traffic:
+
+10.1.1.10 → 198.51.100.20
+
+→ matches NAT selection
+
+→ source is translated.
+
+Internal-to-internal traffic:
+
+10.1.1.10 → 10.2.2.20
+
+→ excluded from this NAT rule
+
+→ addresses remain unchanged unless another rule applies.
+
+Important distinction
+
+A deny entry in a NAT-selection ACL does not itself drop the packet.
+
+The ACL is selecting translation eligibility, not necessarily filtering forwarding.
+
+IOS XE terminology
+
+“NAT exemption” is commonly implemented by excluding traffic from applicable NAT selection. ASA identity-NAT syntax should not be assumed to exist on IOS XE.
+
+
+11. Route-Map and Policy NAT
+
+Function
+
+Chooses a translation using supported policy criteria, such as source, destination, and—in applicable designs—egress-related conditions.
+
+Example
+
+Destination 	Source translation
+Partner network 	10.1.1.10 → 172.20.1.10
+Other external networks 	10.1.1.10 → 203.0.113.10
+
+Packet flow
+
+    Packet arrives.
+    Routing and supported policy matching identify the applicable rule.
+    NAT selects the associated static mapping or pool.
+    Return traffic reverses the selected translation.
+
+
+Use cases
+
+    Partner-specific address presentation.
+    Different pools for different destinations.
+    Multi-ISP translation policies.
+    Conditional static translation, where supported.
+
+
+Important: A NAT route map does not replace routing or independently provide ISP failover.
+
+
+12. Outside-Source NAT
+
+Function
+
+Changes how an outside endpoint’s address is represented inside.
+
+Mapping:
+
+    Outside global: 198.51.100.20
+    Outside local: 172.16.100.20
+
+
+Outside-to-inside flow
+
+Before translation:
+
+198.51.100.20:443 → 10.1.1.10:50000
+
+After translation:
+
+172.16.100.20:443 → 10.1.1.10:50000
+
+Inside-to-outside flow
+
+Before translation:
+
+10.1.1.10:50000 → 172.16.100.20:443
+
+After translation:
+
+10.1.1.10:50000 → 198.51.100.20:443
+
+Use cases
+
+    Representing a remote network through an alias range.
+    Resolving address overlap.
+
+
+Routing consideration
+
+The inside host must reach the outside-local alias through the NAT router. Some applicable command forms offer add-route; verify its exact behavior for the release.
+
+
+13. Overlapping Networks and Both-Endpoint Translation
+
+Scenario
+
+Both sites use 10.1.1.0/24.
+
+Endpoint 	Actual address 	Address presented remotely
+Site A client 	10.1.1.10 	172.20.1.10
+Site B server 	10.1.1.20 	172.21.1.20
+
+Forward flow
+
+Site A sends:
+
+10.1.1.10:50000 → 172.21.1.20:443
+
+After both translations:
+
+172.20.1.10:50000 → 10.1.1.20:443
+
+Return flow
+
+Site B replies:
+
+10.1.1.20:443 → 172.20.1.10:50000
+
+After reverse translation:
+
+172.21.1.20:443 → 10.1.1.10:50000
+
+IOS XE considerations
+
+Supported combinations of inside-source, outside-source, and policy mechanisms can translate both endpoints.
+
+Do not assume ASA “twice NAT” configuration maps directly to IOS XE.
+
+Also distinguish this from double NAT, which can mean translation at two separate routers.
+
+
+14. VRF-Aware NAT
+
+Function
+
+Associates translation with routing contexts, allowing deployments with overlapping tenant addresses.
+
+Example
+
+VRF 	Original endpoint 	Translated endpoint
+VRF-A 	10.1.1.10:50000 	203.0.113.10:50000
+VRF-B 	10.1.1.10:50000 	203.0.113.11:50000
+
+Packet flow
+
+    The packet arrives in a particular VRF.
+    NAT selects a translation applicable to that context.
+    Routing forwards the packet.
+    Return processing identifies the correct mapping and inside context.
+
+
+Design questions
+
+    Is translation within one VRF?
+    Is it between a VRF and the global table?
+    Is the intended inter-VRF design supported?
+    Where are the external and internal routes?
+    Is a command option such as match-in-vrf applicable?
+
+
+NAT does not automatically perform the route leaking required by every VRF design.
+
+
+15. NAT with Multiple ISPs
+
+Function
+
+Uses translated addresses appropriate to the chosen external path.
+
+Packet flow
+
+Through ISP-A:
+
+10.1.1.10 → NAT using ISP-A address → destination
+
+Through ISP-B:
+
+10.1.1.10 → NAT using ISP-B address → destination
+
+Required coordination
+
+    Routing or policy-based routing.
+    NAT rule selection.
+    ISP-specific address reachability.
+    Link tracking.
+    Return-path consistency.
+    Existing translation behavior during failover.
+
+
+Session limitation
+
+If a connection changes from ISP-A’s public address to ISP-B’s address, the remote endpoint generally sees a different flow.
+
+Routing failover alone does not preserve NAT sessions.
+
+
+16. Hairpin NAT, NVI, and NAT-on-a-Stick
+
+16.1 Hairpin NAT
+
+An internal client accesses an internal server through its public address.
+
+Stage 	Packet
+Client request 	10.1.1.10:50000 → 203.0.113.10:443
+Delivered to server 	10.1.1.1:60000 → 10.1.1.20:443
+Server reply 	10.1.1.20:443 → 10.1.1.1:60000
+Delivered to client 	203.0.113.10:443 → 10.1.1.10:50000
+
+Source translation in this example forces the reply through the NAT device. Without it, a same-subnet server might reply directly to the client.
+
+Support caution: Classic NAT does not universally support every same-interface hairpin design.
+
+16.2 NAT Virtual Interface
+
+Where supported, NVI uses NAT-enabled interfaces instead of traditional inside/outside roles.
+
+Conceptually:
+
+Arrival → routing/NAT processing → translation → forwarding
+
+Availability and restrictions vary by platform and release.
+
+16.3 NAT-on-a-stick
+
+This is a topology where traffic enters and exits through the same physical interface, potentially through separate subinterfaces or logical paths.
+
+NVI and NAT-on-a-stick are different concepts. Neither automatically guarantees every hairpin scenario.
+
+
+17. Stateful NAT64
+
+Function
+
+Allows IPv6 clients to communicate with IPv4 servers.
+
+Role 	Address
+IPv6 client 	2001:db8:1::10
+IPv4 server 	198.51.100.20
+IPv6 representation of server 	64:ff9b::c633:6414
+NAT64 IPv4 address 	203.0.113.10
+
+Forward flow
+
+IPv6 packet:
+
+[2001:db8:1::10]:50000 → [64:ff9b::c633:6414]:443
+
+Translated IPv4 packet:
+
+203.0.113.10:60000 → 198.51.100.20:443
+
+Return flow
+
+IPv4 reply:
+
+198.51.100.20:443 → 203.0.113.10:60000
+
+Translated IPv6 reply:
+
+[64:ff9b::c633:6414]:443 → [2001:db8:1::10]:50000
+
+Processing requirements
+
+NAT64 converts:
+
+    IP headers and address family.
+    Addresses and potentially ports.
+    Relevant checksums.
+    Applicable ICMP messages.
+
+
+Verify platform-specific protocol, VRF, ALG, fragmentation, redundancy, and scale restrictions.
+
+
+18. Related IPv6 Translation Technologies
+
+Technology 	Purpose 	Support consideration
+DNS64 	Synthesizes IPv6 DNS answers representing IPv4 destinations 	DNS function, not NAT itself
+Stateless IPv4/IPv6 translation 	Uses algorithmic mappings without per-flow translation state 	Verify explicit implementation support
+NPTv6 	Stateless IPv6 prefix translation 	Do not assume universal IOS XE support
+464XLAT 	Combines CLAT and PLAT translation 	Verify which component is supported
+
+464XLAT flow
+
+IPv4 application → CLAT → IPv6-only network → PLAT/NAT64 → IPv4 server
+
+NAT-PT is an obsolete historical mechanism and should not be treated as modern NAT64.
+
+
+19. Application Layer Gateways
+
+Function
+
+An ALG handles supported protocols containing addresses or ports inside application payloads.
+
+Packet flow
+
+    NAT translates the IP/transport header.
+    The ALG examines supported signaling.
+    Embedded endpoint information may be rewritten.
+    Related translation entries may be created.
+
+
+Examples requiring release verification
+
+    FTP.
+    SIP.
+    H.323.
+    DNS-related translation behavior.
+    Other documented protocol helpers.
+
+
+FTP example
+
+The control connection works, but the application advertises an endpoint for a separate data connection. The ALG may rewrite that endpoint and establish related translation state.
+
+SIP example
+
+SIP signaling can contain addresses in headers or SDP. An ALG may rewrite supported fields so subsequent media flows use reachable endpoints.
+
+Limitations
+
+    Encrypted payloads generally cannot be rewritten this way.
+    Nonstandard ports can require specific handling.
+    Application-native NAT traversal can interact with ALG behavior.
+    ALG state and ordinary NAT state may have different operational requirements.
+
+
+
+20. ICMP, Fragments, and Checksums
+
+ICMP echo
+
+NAT can translate ICMP identifiers to distinguish requests sharing a translated address.
+
+ICMP errors
+
+An ICMP error can quote the original packet. Translation may require changes to:
+
+    Outer addresses.
+    Quoted addresses.
+    Quoted transport information.
+    Checksums.
+
+
+Fragmentation
+
+The first fragment normally carries transport-header information; later fragments do not.
+
+The router must use supported fragment association or reassembly mechanisms to translate consistently.
+
+Areas to validate
+
+    Out-of-order fragments.
+    Fragment resource limits.
+    Path MTU discovery.
+    NAT64 header-size differences.
+    Unsupported protocol or fragmentation cases.
+
+
+
+21. Translation Lifecycle, Timeouts, and Limits
+
+Lifecycle
+
+First packet → mapping creation → reuse → expiration or removal
+
+Static address mappings can remain configured while associated per-flow entries have separate lifecycles.
+
+Dynamic address mappings and child flow entries can also age differently.
+
+Timeout controls
+
+Depending on release, controls can exist for:
+
+    General translation aging.
+    TCP, UDP, and ICMP.
+    TCP establishment and closing states.
+    DNS or other protocol-specific state.
+
+
+Resource limits
+
+Potential controls include:
+
+    Maximum total translations.
+    Per-host or other scoped limits.
+    Address-pool capacity.
+    Port resources.
+    Dataplane capacity.
+
+
+Exhaustion flow
+
+New packet → allocation requested → address, port, or translation limit unavailable → allocation fails.
+
+Very short timers can interrupt valid quiet sessions. Very long timers retain resources unnecessarily.
+
+
+22. CGN-Related Features and Hardware Forwarding
+
+Carrier-grade NAT flow
+
+Client:
+
+192.168.1.10:50000
+
+After home-router PAT:
+
+100.64.1.10:51000
+
+After provider NAT:
+
+203.0.113.10:62000
+
+100.64.0.0/10 is shared address space commonly used in this context.
+
+Specialized features to verify
+
+On applicable platforms and releases:
+
+    High-scale translation processing.
+    Port-block or bulk port allocation.
+    Subscriber-oriented limits.
+    Translation-event export.
+    Mapping and filtering behavior.
+    Logging reduction mechanisms.
+
+
+These are not universal branch-router capabilities.
+
+Hardware performance
+
+NAT performance depends on:
+
+    Packet rate and size.
+    New-session creation rate.
+    Active translation count.
+    ALGs and fragments.
+    Other enabled services.
+    Platform throughput constraints.
+
+
+Ordinary PAT support does not establish suitability for CGN-scale workloads.
+
+
+23. NAT High Availability
+
+Stateless failover
+
+A second router takes over forwarding, but dynamic translation state may be absent. Existing connections can fail.
+
+Stateful redundancy
+
+Where supported:
+
+    Active router creates a translation.
+    Supported state is synchronized.
+    Peer takes over after failure.
+    Existing flows may continue if network reachability and required state are preserved.
+
+
+Validate
+
+    Supported redundancy architecture.
+    Router and release compatibility.
+    Translation and ALG state synchronization.
+    Interface/address takeover.
+    Routing convergence.
+    VRF and NAT64 restrictions.
+
+
+HSRP alone does not synchronize NAT translations.
+
+
+24. NAT in EVPN/VXLAN Fabrics
+
+Typical service placement
+
+Client → access leaf → fabric → border/services router → NAT → external network
+
+Before the NAT service point:
+
+10.1.1.10:50000 → 198.51.100.20:443
+
+After NAT:
+
+203.0.113.10:50000 → 198.51.100.20:443
+
+Design considerations
+
+    VXLAN encapsulation is not NAT.
+    Translation usually operates on the routed tenant packet at an appropriate service point.
+    Tenant VRFs must align with the NAT routing context.
+    Return traffic must reach the correct translation device.
+    ECMP and service-node selection must respect state requirements.
+
+
+Do not infer NAT support on an EVPN/VXLAN device merely because it runs IOS XE.
+
+
+25. Monitoring and Troubleshooting
+
+Common commands
+
+Command 	Purpose
+show ip nat translations 	Display translation entries
+show ip nat translations verbose 	Display additional details where supported
+show ip nat statistics 	Review translation statistics and resource information
+show ip route 	Verify forwarding reachability
+show access-lists 	Check NAT-selection matches
+show route-map 	Inspect policy matching
+
+Additional tools include supported packet captures, platform dataplane counters, NAT64 verification commands, and translation-event logging.
+
+Troubleshooting workflow
+
+    Identify the expected original and translated packet.
+    Verify interface roles or applicable NVI configuration.
+    Confirm route and VRF context.
+    Check ACL and route-map selection.
+    Confirm translation creation.
+    Observe the packet leaving the router.
+    Verify return-packet arrival.
+    Confirm reverse translation and internal forwarding.
+    Investigate limits, timers, ALGs, or fragments if required.
+
+
+Common symptoms
+
+Symptom 	Investigation
+No translation 	Selection policy, interface roles, routing, resource limits
+Translation exists but no reply 	Upstream routing, address reachability, external policy
+Reply arrives but is not delivered 	Reverse mapping, VRF, internal route, asymmetric path
+Application partially works 	ALG, related flows, MTU, fragments, timers
+Failure after ISP switch 	Address change or missing state
+Public service works only externally 	Hairpin support and return-path design
+
+Operational warning: Detailed debugging can increase processing load. Clearing translations can terminate active connections.
+
+
+26. Platform Validation Checklist
+
+Before implementation, confirm:
+
+    Exact router model.
+    Exact IOS XE release.
+    Autonomous or SD-WAN mode.
+    Feature-specific configuration syntax.
+    Supported feature combinations.
+    Translation capacity and session-creation rate.
+    VRF and routing-context restrictions.
+    NAT64 and ALG limitations.
+    Redundancy requirements.
+    Packet-flow behavior in a representative lab.
+
+
+Recommended Cisco documentation
+
+    Platform-specific IOS XE NAT configuration guides.
+    IOS XE NAT command references.
+    NAT64 configuration guides.
+    Platform release notes.
+    Scale and performance documentation.
+    Cisco Feature Navigator, where applicable.
+
+
+
+27. Summary
+
+IOS XE NAT spans several independent dimensions:
+
+    Static versus dynamic: How mappings are established.
+    PAT: How flows share translated addresses.
+    Inside-source and outside-source: Which endpoints are represented differently across NAT domains.
+    ACL and policy NAT: Which traffic receives a translation.
+    VRF-aware NAT: How translation integrates with routing context.
+    NAT64: How IPv6 and IPv4 communicate.
+    Operational capabilities: How state, application handling, resources, forwarding, and redundancy are managed.
+
+
+A successful design requires more than a NAT command: translation policy, routing, return-path symmetry, platform support, and resource capacity must all agree.
